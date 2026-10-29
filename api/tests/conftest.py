@@ -1,7 +1,9 @@
 """Shared fixtures.
 
 Integration tests always run against the separate TEST Neo4j instance (Bolt port 7688,
-`TEST_NEO4J_URI`), never the dev database. If it is not reachable they are skipped.
+`TEST_NEO4J_URI`) and the separate TEST Postgres database (`TEST_POSTGRES_URL`, default
+`crm_test` on the docker Postgres), never the dev databases. If either is not reachable they
+are skipped.
 """
 
 from __future__ import annotations
@@ -11,15 +13,18 @@ from collections.abc import AsyncIterator
 from datetime import date
 from urllib.parse import urlparse
 
+import asyncpg
 import httpx
 import pytest
 from fastapi import FastAPI
 from pydantic import ValidationError
 
 from app.core.settings import get_settings
+from app.repositories import postgres_repo
 from app.seed.generator import SeedDataset, generate
 
 DEFAULT_TEST_NEO4J_URI = "bolt://localhost:7688"
+DEFAULT_TEST_POSTGRES_URL = "postgresql://crm:crm@localhost:5432/crm_test"
 TEST_AS_OF_DATE = "2026-10-06"
 START_HINT = (
     r"start the test instance in another terminal: C:\neo4j\test\bin\neo4j.bat console "
@@ -27,9 +32,9 @@ START_HINT = (
 )
 
 
-def _port_open(uri: str, timeout_s: float = 2.0) -> bool:
+def _port_open(uri: str, timeout_s: float = 2.0, default_port: int = 7687) -> bool:
     parsed = urlparse(uri)
-    host, port = parsed.hostname or "localhost", parsed.port or 7687
+    host, port = parsed.hostname or "localhost", parsed.port or default_port
     try:
         with socket.create_connection((host, port), timeout=timeout_s):
             return True
@@ -51,15 +56,39 @@ def test_neo4j_uri() -> str:
 
 
 @pytest.fixture(scope="session")
-async def api_app(test_neo4j_uri: str) -> AsyncIterator[FastAPI]:
-    """The FastAPI app wired to the TEST database, with its lifespan running."""
+async def test_postgres_url() -> str:
+    """The TEST Postgres URL; creates the database if it does not exist yet."""
+    get_settings.cache_clear()
+    url = get_settings().TEST_POSTGRES_URL or DEFAULT_TEST_POSTGRES_URL
+    parsed = urlparse(url)
+    if not _port_open(url, 2.0, default_port=5432):
+        pytest.skip(f"Test Postgres not reachable at {parsed.hostname}:{parsed.port or 5432}")
+    database = parsed.path.lstrip("/")
+    admin_url = parsed._replace(path="/postgres").geturl()
+    conn = await asyncpg.connect(admin_url)
+    try:
+        exists = await conn.fetchval("SELECT 1 FROM pg_database WHERE datname = $1", database)
+        if not exists:
+            await conn.execute(f'CREATE DATABASE "{database}"')
+    finally:
+        await conn.close()
+    return url
+
+
+@pytest.fixture(scope="session")
+async def api_app(test_neo4j_uri: str, test_postgres_url: str) -> AsyncIterator[FastAPI]:
+    """The FastAPI app wired to the TEST databases, with its lifespan running."""
     mp = pytest.MonkeyPatch()
     mp.setenv("NEO4J_URI", test_neo4j_uri)
+    mp.setenv("POSTGRES_URL", test_postgres_url)
     mp.setenv("SCHEDULER_ENABLED", "false")
+    mp.setenv("PG_SYNC_ENABLED", "false")  # tests write Neo4j through the API only
+    mp.setenv("LIVE_REFRESH_ENABLED", "false")  # tests trigger recomputes explicitly
     mp.setenv("AS_OF_DATE", TEST_AS_OF_DATE)
     get_settings.cache_clear()
     # Safety net: never let tests touch the dev database.
     assert get_settings().NEO4J_URI == test_neo4j_uri
+    assert get_settings().POSTGRES_URL == test_postgres_url
 
     from app.main import create_app
 
@@ -67,6 +96,8 @@ async def api_app(test_neo4j_uri: str) -> AsyncIterator[FastAPI]:
     try:
         # httpx's ASGITransport does not run the lifespan, so run it explicitly.
         async with application.router.lifespan_context(application):
+            # Start from an empty test Postgres so the first seed generates AS_OF 2026-10-06.
+            await postgres_repo.truncate_all()
             yield application
     finally:
         mp.undo()

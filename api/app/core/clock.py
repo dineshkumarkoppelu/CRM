@@ -14,9 +14,9 @@ from app.core.settings import get_settings
 
 
 def today() -> date:
-    """`AS_OF_DATE` when set, otherwise the real current date."""
+    """`AS_OF_DATE` when set, otherwise the current date in UTC."""
     as_of = get_settings().AS_OF_DATE
-    return as_of if as_of is not None else date.today()
+    return as_of if as_of is not None else utc_now().date()
 
 
 def utc_now() -> datetime:

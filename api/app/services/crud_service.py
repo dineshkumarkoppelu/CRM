@@ -12,6 +12,7 @@ from datetime import date
 from enum import Enum
 from typing import Any
 
+from asyncpg import UniqueViolationError
 from neo4j.exceptions import ConstraintError
 
 from app.core import clock
@@ -30,8 +31,14 @@ from app.models.salespeople import (
     SalesPersonUpdate,
     SimilarPeerOut,
 )
-from app.repositories import activities_repo, clients_repo, deals_repo, salespeople_repo
-from app.services import assignment_service, domain_service
+from app.repositories import (
+    activities_repo,
+    clients_repo,
+    deals_repo,
+    postgres_repo,
+    salespeople_repo,
+)
+from app.services import assignment_service, domain_service, live_refresh
 from app.services.recommendation_service import availability
 
 __all__ = ["availability", "month_range", "new_id", "next_state"]
@@ -118,12 +125,32 @@ async def _with_id_retry[T](create: Callable[[], Awaitable[T]]) -> T:
     """Run `create` (which generates fresh ids each call); retry once on an id collision."""
     try:
         return await create()
-    except ConstraintError:
+    except (ConstraintError, UniqueViolationError):
         logger.warning("Generated id collided with an existing one; retrying once")
     try:
         return await create()
-    except ConstraintError as exc:
+    except (ConstraintError, UniqueViolationError) as exc:
         raise AppError("ID_CONFLICT", "Could not generate a unique id; please retry", 409) from exc
+
+
+async def _update_pg_first[T](
+    table: str,
+    row_id: str,
+    changes: dict[str, Any],
+    previous: dict[str, Any],
+    write_neo4j: Callable[[], Awaitable[T]],
+) -> T:
+    """Change the Postgres row first, then Neo4j. If Neo4j fails or refuses (falsy result),
+    the old values go back into Postgres so the two never disagree."""
+    await postgres_repo.update_row(table, row_id, changes)
+    try:
+        result = await write_neo4j()
+    except Exception:
+        await postgres_repo.update_row(table, row_id, {k: previous.get(k) for k in changes})
+        raise
+    if not result:
+        await postgres_repo.update_row(table, row_id, {k: previous.get(k) for k in changes})
+    return result
 
 
 async def _require_rep(rep_id: str) -> dict[str, Any]:
@@ -211,26 +238,51 @@ async def create_sales_person(body: SalesPersonCreate) -> SalesPersonOut:
     capacity = body.capacity or get_config().assignment.capacity_default
 
     async def create() -> dict[str, Any]:
-        return await salespeople_repo.create_sales_person(
-            rep_id=new_id("SP"),
-            name=body.name,
-            email=body.email,
-            region=body.region.value,
-            joined_on=body.joined_on,
-            active=body.active,
-            capacity=capacity,
-        )
+        rep_id = new_id("SP")
+        row = {
+            "id": rep_id,
+            "name": body.name,
+            "email": body.email,
+            "region": body.region.value,
+            "joined_on": body.joined_on,
+            "active": body.active,
+            "capacity": capacity,
+        }
+        await postgres_repo.insert_row("sales_people", row)  # Postgres first
+        try:
+            return await salespeople_repo.create_sales_person(
+                rep_id=rep_id,
+                name=body.name,
+                email=body.email,
+                region=body.region.value,
+                joined_on=body.joined_on,
+                active=body.active,
+                capacity=capacity,
+            )
+        except Exception:
+            await postgres_repo.delete_row("sales_people", rep_id)
+            raise
 
-    return SalesPersonOut(**await _with_id_retry(create))
+    row = await _with_id_retry(create)
+    live_refresh.request()
+    return SalesPersonOut(**row)
 
 
 async def update_sales_person(rep_id: str, body: SalesPersonUpdate) -> SalesPersonOut:
     changes = _plain(body.model_dump(exclude_unset=True))
+    rep = await _require_rep(rep_id)
     if not changes:
-        return SalesPersonOut(**await _require_rep(rep_id))
-    row = await salespeople_repo.update_sales_person(rep_id, changes)
+        return SalesPersonOut(**rep)
+    row = await _update_pg_first(
+        "sales_people",
+        rep_id,
+        changes,
+        rep,
+        lambda: salespeople_repo.update_sales_person(rep_id, changes),
+    )
     if row is None:
         raise _not_found("REP_NOT_FOUND", "Sales person", rep_id)
+    live_refresh.request()
     return SalesPersonOut(**row)
 
 
@@ -252,33 +304,53 @@ async def get_client(client_id: str) -> ClientDetail:
 
 
 async def create_client_with_deal(body: ClientWithDealCreate) -> ClientCreateResult:
-    """Client + first deal in ONE transaction, then the assignment hook (or MANUAL owner)."""
+    """Client + first deal: Postgres first, then Neo4j, then the assignment (or MANUAL owner).
+
+    Postgres is the source of truth, so the rows are saved there before Neo4j sees them. If the
+    Neo4j write fails, the Postgres rows are removed again so the two never disagree.
+    """
     domain = await domain_service.require_domain(body.deal.domain)
     owner = await _check_manual_owner(body.deal.owner_id)
     today = clock.today()
+    owner_id = owner["id"] if owner else None
 
     async def create() -> dict[str, Any]:
-        return await clients_repo.create_client_with_deal(
-            client={
-                "id": new_id("CL"),
-                "name": body.client.name,
-                "industry": body.client.industry,
-                "size": body.client.size.value,
-                "region": body.client.region.value,
+        client = {
+            "id": new_id("CL"),
+            "name": body.client.name,
+            "industry": body.client.industry,
+            "size": body.client.size.value,
+            "region": body.client.region.value,
+        }
+        deal = {
+            "id": new_id("DL"),
+            "title": body.deal.title,
+            "value": body.deal.value,
+            "domain": domain,
+            "expected_close_date": body.deal.expected_close_date,
+        }
+        await postgres_repo.insert_client_with_deal(
+            {**client, "created_on": today},
+            {
+                **deal,
+                "status": "OPEN",
+                "stage": "LEAD",
+                "created_at": today,
+                "client_id": client["id"],
+                "owner_id": owner_id,
             },
-            deal={
-                "id": new_id("DL"),
-                "title": body.deal.title,
-                "value": body.deal.value,
-                "domain": domain,
-                "expected_close_date": body.deal.expected_close_date,
-            },
-            owner_id=owner["id"] if owner else None,
-            today=today,
         )
+        try:
+            return await clients_repo.create_client_with_deal(
+                client=client, deal=deal, owner_id=owner_id, today=today
+            )
+        except Exception:
+            await postgres_repo.delete_client_with_deal(client["id"], deal["id"])
+            raise
 
     ids = await _with_id_retry(create)
     assignment = await _assignment_for_new_deal(ids["deal_id"], domain, owner)
+    live_refresh.request()
     client = await clients_repo.get_client(ids["client_id"])
     deal = await _require_deal(ids["deal_id"])
     return ClientCreateResult(
@@ -336,20 +408,43 @@ async def create_deal(body: DealCreate) -> DealCreateResult:
     async def create() -> bool:
         nonlocal deal_id
         deal_id = new_id("DL")
-        return await deals_repo.create_deal_for_client(
-            deal_id=deal_id,
-            client_id=body.client_id,
-            title=body.title,
-            value=body.value,
-            domain=domain,
-            expected_close_date=body.expected_close_date,
-            owner_id=owner["id"] if owner else None,
-            today=today,
+        await postgres_repo.insert_row(  # Postgres first
+            "deals",
+            {
+                "id": deal_id,
+                "title": body.title,
+                "value": body.value,
+                "status": "OPEN",
+                "stage": "LEAD",
+                "created_at": today,
+                "expected_close_date": body.expected_close_date,
+                "domain": domain,
+                "client_id": body.client_id,
+                "owner_id": owner["id"] if owner else None,
+            },
         )
+        try:
+            created = await deals_repo.create_deal_for_client(
+                deal_id=deal_id,
+                client_id=body.client_id,
+                title=body.title,
+                value=body.value,
+                domain=domain,
+                expected_close_date=body.expected_close_date,
+                owner_id=owner["id"] if owner else None,
+                today=today,
+            )
+        except Exception:
+            await postgres_repo.delete_row("deals", deal_id)
+            raise
+        if not created:  # client deleted in the meantime
+            await postgres_repo.delete_row("deals", deal_id)
+        return created
 
     if not await _with_id_retry(create):  # client deleted in the meantime
         raise _not_found("CLIENT_NOT_FOUND", "Client", body.client_id)
     assignment = await _assignment_for_new_deal(deal_id, domain, owner)
+    live_refresh.request()
     return DealCreateResult(deal=DealOut(**await _require_deal(deal_id)), assignment=assignment)
 
 
@@ -357,8 +452,16 @@ async def move_deal_stage(deal_id: str, action: StageAction) -> DealOut:
     deal = await _require_deal(deal_id)
     new_status, new_stage, date_field = next_state(deal["status"], deal["stage"], action)
     changes = {"status": new_status, "stage": new_stage, date_field: clock.today()}
-    if not await deals_repo.move_stage(deal_id, deal["status"], deal["stage"], changes):
+    moved = await _update_pg_first(
+        "deals",
+        deal_id,
+        changes,
+        deal,
+        lambda: deals_repo.move_stage(deal_id, deal["status"], deal["stage"], changes),
+    )
+    if not moved:
         raise AppError("CONFLICT", "Deal was changed by another request; reload and retry", 409)
+    live_refresh.request()
     return DealOut(**await _require_deal(deal_id))
 
 
@@ -369,10 +472,13 @@ async def update_deal(deal_id: str, body: DealUpdate) -> DealOut:
             "DEAL_CLOSED", f"Deal is {deal['status']}; only OPEN deals can be edited", 400
         )
     changes = _plain(body.model_dump(exclude_unset=True))
-    if changes and not await deals_repo.update_open_deal(deal_id, changes):
+    if changes and not await _update_pg_first(
+        "deals", deal_id, changes, deal, lambda: deals_repo.update_open_deal(deal_id, changes)
+    ):
         raise AppError(
             "DEAL_CLOSED", "Deal was closed in the meantime; it can no longer be edited", 400
         )
+    live_refresh.request()
     return DealOut(**await _require_deal(deal_id))
 
 
@@ -399,14 +505,34 @@ async def create_activity(body: ActivityCreate) -> ActivityOut:
         )
 
     async def create() -> dict[str, Any] | None:
-        return await activities_repo.create_activity(
-            activity_id=new_id("AC"),
-            deal_id=body.deal_id,
-            sales_person_id=body.sales_person_id,
-            activity_type=body.type.value,
-            activity_date=activity_date,
-            outcome=body.outcome.value,
+        # Postgres first; removed again if Neo4j does not take the activity.
+        activity_id = new_id("AC")
+        await postgres_repo.insert_row(
+            "activities",
+            {
+                "id": activity_id,
+                "type": body.type.value,
+                "date": activity_date,
+                "outcome": body.outcome.value,
+                "deal_id": body.deal_id,
+                "sales_person_id": body.sales_person_id,
+            },
         )
+        try:
+            row = await activities_repo.create_activity(
+                activity_id=activity_id,
+                deal_id=body.deal_id,
+                sales_person_id=body.sales_person_id,
+                activity_type=body.type.value,
+                activity_date=activity_date,
+                outcome=body.outcome.value,
+            )
+        except Exception:
+            await postgres_repo.delete_row("activities", activity_id)
+            raise
+        if row is None:
+            await postgres_repo.delete_row("activities", activity_id)
+        return row
 
     row = await _with_id_retry(create)
     if row is None:  # deal or rep deleted in the meantime

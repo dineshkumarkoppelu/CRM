@@ -26,12 +26,19 @@ class Settings(BaseSettings):
     NEO4J_URI: str = "bolt://localhost:7687"
     NEO4J_USER: str = "neo4j"
     NEO4J_PASSWORD: str
+    # Postgres holds the raw CRM rows; Neo4j is loaded from it (see seed_service).
+    POSTGRES_URL: str = "postgresql://crm:crm@localhost:5432/crm"
     AS_OF_DATE: date | None = None
     LOG_LEVEL: str = "INFO"
     SCHEDULER_ENABLED: bool = True
     TEST_NEO4J_URI: str | None = None
+    TEST_POSTGRES_URL: str | None = None
+    # Push changes made in Postgres by anything other than this app into Neo4j as they happen.
+    PG_SYNC_ENABLED: bool = True
+    # Recompute win rates / similarity and assign unowned deals soon after any data change.
+    LIVE_REFRESH_ENABLED: bool = True
 
-    @field_validator("AS_OF_DATE", "TEST_NEO4J_URI", mode="before")
+    @field_validator("AS_OF_DATE", "TEST_NEO4J_URI", "TEST_POSTGRES_URL", mode="before")
     @classmethod
     def _empty_is_none(cls, value: object) -> object:
         # `AS_OF_DATE=` in .env means "not set" (use the real date).

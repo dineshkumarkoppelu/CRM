@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -26,9 +26,9 @@ def test_today_uses_as_of_date(as_of) -> None:
     assert clock.today() == date(2026, 10, 6)
 
 
-def test_today_falls_back_to_real_date(as_of) -> None:
+def test_today_falls_back_to_utc_date(as_of) -> None:
     as_of(None)
-    assert clock.today() == date.today()
+    assert clock.today() == datetime.now(UTC).date()
 
 
 @pytest.mark.parametrize(

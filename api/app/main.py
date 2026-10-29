@@ -11,12 +11,13 @@ from pathlib import Path
 
 from fastapi import FastAPI
 
-from app.core import db
+from app.core import db, pg
 from app.core.config import ConfigError, get_config
 from app.core.errors import register_exception_handlers
 from app.core.logging import add_request_logging, configure_logging
-from app.core.settings import get_settings
+from app.core.settings import Settings, get_settings
 from app.core.spa import DEFAULT_UI_DIST, mount_spa
+from app.repositories import postgres_repo
 from app.routers import (
     activities,
     admin,
@@ -31,7 +32,7 @@ from app.routers import (
     salespeople,
 )
 from app.schema import runner as schema_runner
-from app.services import domain_service, expertise_service, scheduler
+from app.services import domain_service, expertise_service, live_refresh, pg_sync, scheduler
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,10 @@ async def _after_schema() -> None:
         await domain_service.ensure_builtin_domains()
     except db.CONNECTIVITY_ERRORS as exc:
         logger.warning("Built-in domain setup skipped: %s", exc)
+    if get_settings().LIVE_REFRESH_ENABLED:
+        live_refresh.start()  # keep win rates, similarity and owners current after any change
+    if get_settings().PG_SYNC_ENABLED:
+        pg_sync.start()  # push changes made in Postgres by other tools into Neo4j, live
     await _recompute_if_missing_safely()
 
 
@@ -52,6 +57,15 @@ async def _recompute_if_missing_safely() -> None:
         await expertise_service.recompute_if_missing()
     except db.CONNECTIVITY_ERRORS as exc:
         logger.warning("Startup recompute check skipped: %s", exc)
+
+
+async def _init_postgres(settings: Settings) -> None:
+    """Startup: connect to Postgres and create its tables. Degraded (not fatal) if unreachable."""
+    try:
+        if await pg.init_pool(settings):
+            await postgres_repo.ensure_tables()
+    except pg.CONNECTIVITY_ERRORS as exc:
+        logger.warning("Postgres setup skipped: %s", exc)
 
 
 @asynccontextmanager
@@ -66,6 +80,8 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         logger.critical("%s", exc)
         raise
 
+    await _init_postgres(settings)
+
     background: asyncio.Task[None] | None = None
     if await db.init_driver(settings):
         if await schema_runner.apply_schema_safely():
@@ -79,12 +95,15 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        await pg_sync.stop()
+        await live_refresh.stop()
         scheduler.stop()
         if background is not None:
             background.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await background
         await db.close_driver()
+        await pg.close_pool()
 
 
 def create_app(ui_dist: Path = DEFAULT_UI_DIST) -> FastAPI:

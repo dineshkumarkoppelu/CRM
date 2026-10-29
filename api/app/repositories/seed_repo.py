@@ -1,4 +1,7 @@
-"""Cypher for wiping the database and bulk-loading the synthetic dataset."""
+"""Cypher for wiping the database and loading rows from Postgres into Neo4j.
+
+The LOAD_* statements are upserts (MERGE), so the seed and the live Postgres->Neo4j sync share them.
+"""
 
 from __future__ import annotations
 
@@ -39,7 +42,6 @@ LOAD_DEALS = """
 UNWIND $rows AS row
 MATCH (c:Client {id: row.client_id})
 MATCH (dom:Domain {name: row.domain})
-MATCH (s:SalesPerson {id: row.owner_id})
 MERGE (d:Deal {id: row.id})
 SET d.title = row.title,
     d.value = row.value,
@@ -51,9 +53,19 @@ SET d.title = row.title,
     d.negotiation_at = row.negotiation_at,
     d.expected_close_date = row.expected_close_date,
     d.closed_at = row.closed_at
+WITH d, row, c, dom
+CALL (d, c) { OPTIONAL MATCH (d)-[r:FOR_CLIENT]->(x:Client) WHERE x.id <> c.id DELETE r }
+CALL (d, dom) { OPTIONAL MATCH (d)-[r:IN_DOMAIN]->(x:Domain) WHERE x.name <> dom.name DELETE r }
+CALL (d, row) {
+  OPTIONAL MATCH (x:SalesPerson)-[r:OWNS]->(d)
+  WHERE row.owner_id IS NOT NULL AND x.id <> row.owner_id
+  DELETE r
+}
 MERGE (d)-[:FOR_CLIENT]->(c)
 MERGE (d)-[:IN_DOMAIN]->(dom)
-MERGE (s)-[:OWNS]->(d)
+WITH d, row
+OPTIONAL MATCH (s:SalesPerson {id: row.owner_id})
+FOREACH (_ IN CASE WHEN s IS NULL THEN [] ELSE [1] END | MERGE (s)-[:OWNS]->(d))
 """
 
 LOAD_ACTIVITIES = """
@@ -67,6 +79,14 @@ SET a.type = row.type,
 MERGE (s)-[:PERFORMED]->(a)
 MERGE (a)-[:ON_DEAL]->(d)
 """
+
+# Label per Postgres table, for deleting nodes whose row was deleted.
+LABELS = {
+    "sales_people": "SalesPerson",
+    "clients": "Client",
+    "deals": "Deal",
+    "activities": "Activity",
+}
 
 COUNTS = """
 RETURN
@@ -107,6 +127,12 @@ async def load_deals(rows: list[dict[str, Any]]) -> None:
 
 async def load_activities(rows: list[dict[str, Any]]) -> None:
     await _load_in_batches(LOAD_ACTIVITIES, rows)
+
+
+async def delete_nodes(table: str, ids: list[str]) -> None:
+    """Remove the nodes (and their relationships) for rows deleted in Postgres."""
+    label = LABELS[table]  # a fixed set, so safe to put in the query
+    await run_write(f"UNWIND $ids AS id MATCH (n:{label} {{id: id}}) DETACH DELETE n", {"ids": ids})
 
 
 async def counts() -> dict[str, int]:

@@ -4,6 +4,7 @@ rank with the pure `recommendation_service`, write RECOMMENDED_TO / OWNS, overri
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,10 +17,12 @@ from app.models.assignment import (
     RecommendationOut,
     UnavailableRep,
 )
-from app.repositories import deals_repo, recommendation_repo
+from app.repositories import deals_repo, postgres_repo, recommendation_repo
 from app.repositories.recommendation_repo import OwnerConflict
-from app.services import domain_service
+from app.services import domain_service, live_refresh
 from app.services import recommendation_service as rs
+
+logger = logging.getLogger(__name__)
 
 NO_AVAILABLE_MESSAGE = "No available sales person (all inactive or at capacity)"
 OVERRIDE_PREFIX = "Manual override: "
@@ -117,6 +120,14 @@ async def _require_open_deal(deal_id: str) -> dict[str, Any]:
     return deal
 
 
+async def _save_owner(deal_id: str, owner_id: str) -> None:
+    """Keep Postgres in step with the owner the engine just chose in Neo4j."""
+    try:
+        await postgres_repo.set_deal_owner(deal_id, owner_id)
+    except Exception:
+        logger.exception("Could not save owner of deal %s to Postgres", deal_id)
+
+
 # ---------------------------------------------------------------------------
 # Assign / preview
 # ---------------------------------------------------------------------------
@@ -152,6 +163,8 @@ async def assign_deal(deal_id: str) -> AssignmentResult:
         raise AppError(
             "ALREADY_ASSIGNED", "Deal was assigned or closed by another request", 409
         ) from exc
+    if top:
+        await _save_owner(deal_id, top.sales_person_id)
 
     return AssignmentResult(
         deal_id=deal_id,
@@ -280,8 +293,14 @@ async def override(deal_id: str, rep_id: str) -> AssignmentResult:
         "reason": OVERRIDE_PREFIX + fit.reason,
         "status": "ASSIGNED",
     }
+    await postgres_repo.set_deal_owner(deal_id, rep_id)  # Postgres first
     try:
         await recommendation_repo.override_owner(deal_id, rep_id, new_rec, clock.today())
     except OwnerConflict as exc:
+        await postgres_repo.set_deal_owner(deal_id, deal["owner_id"])
         raise AppError("DEAL_CLOSED", "Deal was closed by another request", 400) from exc
+    except Exception:
+        await postgres_repo.set_deal_owner(deal_id, deal["owner_id"])
+        raise
+    live_refresh.request()  # the new owner's workload changed
     return await get_recommendations(deal_id, f"Manual override: assigned to {target.name}")

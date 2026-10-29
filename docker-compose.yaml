@@ -36,6 +36,31 @@ services:
       start_period: 30s
 
 
+  postgres:
+    image: postgres:16
+    container_name: dealgraph-postgres
+
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-crm}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-crm}
+      POSTGRES_DB: ${POSTGRES_DB:-crm}
+
+    ports:
+      - "5432:5432"
+
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-crm} -d ${POSTGRES_DB:-crm}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+    restart: unless-stopped
+
+
   app:
     build:
       context: .
@@ -47,6 +72,7 @@ services:
       NEO4J_USER: neo4j
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:?Copy .env.example to .env and set NEO4J_PASSWORD}
       NEO4J_URI: bolt://neo4j:7687
+      POSTGRES_URL: postgresql://${POSTGRES_USER:-crm}:${POSTGRES_PASSWORD:-crm}@postgres:5432/${POSTGRES_DB:-crm}
 
       AS_OF_DATE: ${AS_OF_DATE:-}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
@@ -76,11 +102,14 @@ services:
     depends_on:
       neo4j:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
 
     restart: unless-stopped
 
 
 volumes:
+  postgres-data:
   neo4j-data:
   neo4j-logs:
   app-models:

@@ -1,4 +1,4 @@
-"""Wipe the database and load the deterministic synthetic dataset."""
+"""Fill Postgres on first run, then wipe Neo4j and reload it from Postgres."""
 
 from __future__ import annotations
 
@@ -8,38 +8,45 @@ import time
 from app.core import clock, db
 from app.core.config import get_config
 from app.models.admin import SeedCounts, SeedResult
-from app.repositories import seed_repo
+from app.repositories import postgres_repo, seed_repo
 from app.schema import runner as schema_runner
 from app.seed.generator import generate
-from app.services import busy, domain_service, expertise_service
+from app.services import busy, domain_service, expertise_service, pg_sync
 
 logger = logging.getLogger(__name__)
 
 
 async def seed_database() -> SeedResult:
-    """Wipe and reload the demo data, then recompute. 409 BUSY if seed/recompute is running.
+    """Rebuild Neo4j from Postgres, then recompute. 409 BUSY if seed/recompute is running.
 
+    Postgres is only generated into when it is empty; otherwise it is left untouched.
     Exempt from the 15 s transaction timeout; the duration is logged and returned.
     """
-    async with busy.exclusive("seed"):
+    async with busy.exclusive("seed"), pg_sync.LOCK:  # live sync waits until the reload is done
         with db.no_tx_timeout():
             return await _seed()
 
 
 async def _seed() -> SeedResult:
-    """Generate (in memory) -> wipe -> schema init -> load -> recompute."""
+    """Postgres (generate if empty) -> read -> wipe Neo4j -> schema init -> load -> recompute."""
     started = time.perf_counter()
     config = get_config()
     today = clock.today()
     seed = config.seed.seed_random_seed
 
-    # Generate first: if this fails, the database is left untouched.
-    dataset = generate(
-        seed=seed,
-        today=today,
-        lookback_months=config.analytics.lookback_months,
-        capacity=config.assignment.capacity_default,
-    )
+    # Postgres first: if generating or reading fails, Neo4j is left untouched.
+    await postgres_repo.ensure_tables()
+    generated = await postgres_repo.is_empty()
+    if generated:
+        await postgres_repo.insert_dataset(
+            generate(
+                seed=seed,
+                today=today,
+                lookback_months=config.analytics.lookback_months,
+                capacity=config.assignment.capacity_default,
+            )
+        )
+    dataset = await postgres_repo.read_dataset()
 
     await seed_repo.wipe_all()
     await schema_runner.apply_schema()  # recreates the 5 built-in Domain nodes
@@ -53,11 +60,13 @@ async def _seed() -> SeedResult:
 
     duration_ms = round((time.perf_counter() - started) * 1000)
     logger.info(
-        "Seeded %d deals, %d clients, %d activities in %d ms (seed=%d, as_of=%s)",
+        "Loaded %d deals, %d clients, %d activities from Postgres in %d ms "
+        "(generated into Postgres: %s, seed=%d, as_of=%s)",
         counts.Deal,
         counts.Client,
         counts.Activity,
         duration_ms,
+        generated,
         seed,
         today,
     )

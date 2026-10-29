@@ -42,9 +42,12 @@ curl -X POST http://localhost:8000/api/admin/seed
 # PowerShell: Invoke-RestMethod -Method Post http://localhost:8000/api/admin/seed
 ```
 
-This loads 15 sales people, ~366 clients, 695 deals and ~2.9k activities. Set
-`AS_OF_DATE=2026-10-06` in `.env` (before seeding) to get exactly the data the tests and demo
-numbers are based on.
+Seeding goes through Postgres: if the Postgres database (the `postgres` compose service) is
+empty, the generator fills it first; then Neo4j is wiped and loaded from Postgres. Later seeds
+("Reset demo data") only rebuild Neo4j and leave Postgres untouched. Without `AS_OF_DATE`, "today"
+is the current UTC date. This loads 15 sales people, ~366 clients, 695 deals and ~2.9k
+activities. Set `AS_OF_DATE=2026-10-06` in `.env` (before the first seed) to get exactly the data
+the tests and demo numbers are based on.
 
 | What | Where |
 |---|---|
@@ -52,6 +55,7 @@ numbers are based on.
 | API docs (Swagger) | http://localhost:8000/docs |
 | Health | http://localhost:8000/api/health |
 | Neo4j Browser | http://localhost:7474 (user `neo4j`, password from `.env`) |
+| Postgres | `localhost:5432` (user/password/database `crm` by default; see `POSTGRES_*` in `.env`) |
 
 Useful commands:
 ```bash

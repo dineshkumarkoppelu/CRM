@@ -196,5 +196,18 @@ async def update_open_deal(deal_id: str, changes: dict[str, Any]) -> bool:
     return bool(await run_write(UPDATE_OPEN, {"id": deal_id, "changes": changes}))
 
 
+LIST_UNOWNED_OPEN = """
+MATCH (d:Deal {status: 'OPEN'})
+WHERE NOT EXISTS { (:SalesPerson)-[:OWNS]->(d) }
+RETURN d.id AS id
+ORDER BY d.created_at, d.id
+"""
+
+
+async def list_unowned_open_ids() -> list[str]:
+    """OPEN deals nobody owns yet (they are waiting for an assignment)."""
+    return [row["id"] for row in await run_read(LIST_UNOWNED_OPEN)]
+
+
 async def list_recommendations(deal_id: str) -> list[dict[str, Any]]:
     return await run_read(LIST_RECOMMENDATIONS, {"id": deal_id})

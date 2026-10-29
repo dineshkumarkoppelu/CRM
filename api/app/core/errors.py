@@ -9,6 +9,7 @@ import logging
 from http import HTTPStatus
 from typing import Any
 
+import asyncpg
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
@@ -87,6 +88,15 @@ async def _neo4j_error_handler(request: Request, exc: Exception) -> JSONResponse
     return error_response(500, "DATABASE_ERROR", "The database rejected the request")
 
 
+async def _postgres_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Postgres failures get a clear code instead of a generic 500."""
+    if isinstance(exc, (asyncpg.InterfaceError, asyncpg.PostgresConnectionError)):
+        logger.warning("Postgres unavailable on %s %s: %s", request.method, request.url.path, exc)
+        return error_response(503, "POSTGRES_UNAVAILABLE", "Postgres is not reachable")
+    logger.error("Postgres error on %s %s", request.method, request.url.path, exc_info=exc)
+    return error_response(500, "DATABASE_ERROR", "The database rejected the request")
+
+
 async def _unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:
     logger.exception("Unhandled error on %s %s", request.method, request.url.path, exc_info=exc)
     return error_response(500, "INTERNAL_ERROR", "An unexpected error occurred")
@@ -99,4 +109,6 @@ def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(Neo4jError, _neo4j_error_handler)
     app.add_exception_handler(ServiceUnavailable, _neo4j_error_handler)
     app.add_exception_handler(SessionExpired, _neo4j_error_handler)
+    app.add_exception_handler(asyncpg.PostgresError, _postgres_error_handler)
+    app.add_exception_handler(asyncpg.InterfaceError, _postgres_error_handler)
     app.add_exception_handler(Exception, _unhandled_error_handler)
