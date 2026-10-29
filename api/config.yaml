@@ -1,0 +1,57 @@
+# Business tunables for the CRM Graph POC.
+# Source of truth for meaning and defaults: .kiro/steering/domain-rules.md section 0.
+# Every key is required. The API refuses to start if a value is invalid.
+
+analytics:
+  # Lookback window in calendar months for expertise, similarity and the forecast table.
+  lookback_months: 12
+  # An OPEN deal is "stalled" when its last activity (or created_at) is older than this.
+  stalled_days: 21
+
+expertise:
+  # Closed deals needed in a domain (inside the window) before a win rate "qualifies".
+  # Also the minimum sample size for the forecast probability table.
+  min_deals_per_domain: 3
+
+similarity:
+  # Two reps match in a domain when their qualifying win rates differ by at most this.
+  similarity_tolerance: 0.10
+  # Matching domains needed for two reps to be SIMILAR_TO.
+  similarity_min_domains: 3
+
+assignment:
+  # score = weight_fit * fit + weight_availability * availability (weights must sum to 1.0).
+  weight_fit: 0.7
+  weight_availability: 0.3
+  # Multiplier applied to a PEER fit (borrowed win rate).
+  peer_discount: 0.8
+  # Max OPEN deals for newly created reps.
+  capacity_default: 8
+  # RECOMMENDED_TO edges stored per deal.
+  max_candidates: 5
+
+forecast:
+  # Client probability at or above this counts as "commit".
+  forecast_commit_threshold: 0.70
+  # Client probability at or above this counts as "best case".
+  forecast_best_case_threshold: 0.30
+
+domains:
+  # Local sentence-embedding model used to compare domain descriptions (fastembed/ONNX).
+  embedding_model: "BAAI/bge-small-en-v1.5"
+  # A new domain borrows from at most this many of the most similar existing domains...
+  related_top_k: 3
+  # ...and only from those with cosine similarity above this. The weight of a related domain
+  # is (similarity - related_min_similarity), so clearly closer domains count more. (This
+  # model gives unrelated business domains about 0.60-0.65.)
+  related_min_similarity: 0.65
+  # Multiplier applied to a RELATED fit (win rate borrowed from similar domains).
+  related_discount: 0.7
+
+scheduler:
+  # Nightly EXPERTISE_IN / SIMILAR_TO recompute (cron, server local time).
+  recompute_cron: "0 2 * * *"
+
+seed:
+  # Random seed for the deterministic synthetic data generator.
+  seed_random_seed: 42

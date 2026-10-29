@@ -1,0 +1,86 @@
+services:
+
+  neo4j:
+    image: neo4j:5.26.31
+    container_name: dealgraph-neo4j
+
+    environment:
+      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD:?Copy .env.example to .env and set NEO4J_PASSWORD}"
+    
+      NEO4J_PLUGINS: '["apoc", "graph-data-science"]'
+
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*,gds.*"
+      NEO4J_dbms_security_procedures_allowlist: "apoc.*,gds.*"
+
+      NEO4J_server_memory_heap_initial__size: "1G"
+      NEO4J_server_memory_heap_max__size: "1G"
+      NEO4J_server_memory_pagecache_size: "512M"
+
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+
+    volumes:
+      - neo4j-data:/data
+      - neo4j-logs:/logs
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "cypher-shell -u neo4j -p '${NEO4J_PASSWORD}' 'RETURN 1' || exit 1"
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    container_name: dealgraph-app
+
+    environment:
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:?Copy .env.example to .env and set NEO4J_PASSWORD}
+      NEO4J_URI: bolt://neo4j:7687
+
+      AS_OF_DATE: ${AS_OF_DATE:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+      SCHEDULER_ENABLED: ${SCHEDULER_ENABLED:-true}
+
+    ports:
+      - "8000:8000"
+
+    volumes:
+      # Embedding model for "New domain" (~64 MB, downloaded on first use); survives rebuilds.
+      - app-models:/app/api/.models
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health', timeout=5)"
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+    depends_on:
+      neo4j:
+        condition: service_healthy
+
+    restart: unless-stopped
+
+
+volumes:
+  neo4j-data:
+  neo4j-logs:
+  app-models:
