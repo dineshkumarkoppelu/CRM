@@ -31,13 +31,36 @@ class Settings(BaseSettings):
     SCHEDULER_ENABLED: bool = True
     TEST_NEO4J_URI: str | None = None
 
-    @field_validator("AS_OF_DATE", "TEST_NEO4J_URI", mode="before")
+    # Postgres source of truth (the "Host db" API). When SOURCE_API_URL is set, Neo4j becomes a
+    # live copy of it and UI writes go through that API. Leave empty for the standalone
+    # Neo4j-only mode (synthetic seed, used by the tests).
+    SOURCE_API_URL: str | None = None
+    SOURCE_API_KEY: str | None = None
+    # Direct Postgres connection used only for LISTEN crm_changes (real-time). Without it the
+    # app polls the API every SYNC_POLL_SECONDS instead.
+    SOURCE_PG_DSN: str | None = None
+    SYNC_POLL_SECONDS: float = 5.0
+    SYNC_RECONCILE_SECONDS: float = 300.0
+    SYNC_RECOMPUTE_DEBOUNCE_SECONDS: float = 3.0
+
+    @field_validator(
+        "AS_OF_DATE",
+        "TEST_NEO4J_URI",
+        "SOURCE_API_URL",
+        "SOURCE_API_KEY",
+        "SOURCE_PG_DSN",
+        mode="before",
+    )
     @classmethod
     def _empty_is_none(cls, value: object) -> object:
         # `AS_OF_DATE=` in .env means "not set" (use the real date).
         if isinstance(value, str) and value.strip() == "":
             return None
         return value
+
+    @property
+    def source_enabled(self) -> bool:
+        return bool(self.SOURCE_API_URL and self.SOURCE_API_KEY)
 
     @field_validator("LOG_LEVEL")
     @classmethod

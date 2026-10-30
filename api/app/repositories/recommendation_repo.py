@@ -118,15 +118,21 @@ async def replace_recommendations(
     await run_in_write_tx(work)
 
 
-async def override_owner(deal_id: str, rep_id: str, new_rec: dict[str, Any], today: date) -> None:
+async def override_owner(
+    deal_id: str, rep_id: str, new_rec: dict[str, Any], today: date, *, move_owner: bool = True
+) -> None:
     """ONE transaction: move OWNS to `rep_id`, mark the old ASSIGNED recommendation OVERRIDDEN,
-    set the target's recommendation to ASSIGNED or create `new_rec` (rank 0) if it has none."""
+    set the target's recommendation to ASSIGNED or create `new_rec` (rank 0) if it has none.
+
+    `move_owner=False` leaves OWNS alone (data-source mode: the owner is written to the
+    source and reaches the graph through the sync)."""
     params = {"deal_id": deal_id, "rep_id": rep_id}
 
     async def work(tx: AsyncManagedTransaction) -> None:
-        await tx_run(tx, REMOVE_OWNER, params)
-        if (await tx_run(tx, SET_OWNER_IF_OPEN, params))[0]["n"] != 1:
-            raise OwnerConflict(deal_id)
+        if move_owner:
+            await tx_run(tx, REMOVE_OWNER, params)
+            if (await tx_run(tx, SET_OWNER_IF_OPEN, params))[0]["n"] != 1:
+                raise OwnerConflict(deal_id)
         await tx_run(tx, MARK_OVERRIDDEN, params)
         if (await tx_run(tx, SET_EXISTING_ASSIGNED, params))[0]["n"] == 0:
             await tx_run(

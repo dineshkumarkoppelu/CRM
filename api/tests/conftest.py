@@ -57,6 +57,10 @@ async def api_app(test_neo4j_uri: str) -> AsyncIterator[FastAPI]:
     mp.setenv("NEO4J_URI", test_neo4j_uri)
     mp.setenv("SCHEDULER_ENABLED", "false")
     mp.setenv("AS_OF_DATE", TEST_AS_OF_DATE)
+    # Never let a real data source (api/.env) leak into the tests: they run standalone, and the
+    # source-sync tests use an in-memory fake.
+    for name in ("SOURCE_API_URL", "SOURCE_API_KEY", "SOURCE_PG_DSN"):
+        mp.setenv(name, "")
     get_settings.cache_clear()
     # Safety net: never let tests touch the dev database.
     assert get_settings().NEO4J_URI == test_neo4j_uri

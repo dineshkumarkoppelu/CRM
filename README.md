@@ -11,7 +11,7 @@ There are two ways to run it:
 
 ```
 .
-├── api/                  FastAPI backend (Python): app/, tests/, scripts/, config.yaml, .env.example
+├── api/                  FastAPI backend (Python): app/ (app/sync = Postgres live sync), tests/, scripts/, config.yaml, .env.example
 ├── ui/                   React + TypeScript web UI (built into ui/dist, served by the API)
 ├── scripts/              PowerShell helpers for the native setup: start.ps1, reset.ps1, test.ps1
 ├── Dockerfile            Builds the UI, then the API image that serves it
@@ -172,6 +172,58 @@ Invoke-RestMethod http://localhost:8000/api/health | ConvertTo-Json -Depth 5
   http://localhost:8000/api/meta/config.
 - On every start the API applies `api/app/schema/init.cypher` (5 uniqueness constraints,
   6 range indexes, the 5 built-in Domain nodes). It is idempotent; `/api/health` shows `schema_ok`.
+
+## Live data source (Postgres)
+By default the app is standalone: Neo4j holds a synthetic dataset. Set `SOURCE_API_URL` and
+`SOURCE_API_KEY` (and ideally `SOURCE_PG_DSN`) in `api/.env` and **Postgres becomes the source of
+truth**: Neo4j mirrors it in real time and everything else (KPIs, forecast, recommendations,
+graph explorer) keeps working on Neo4j as before.
+
+```
+Postgres tables ──(crm_changes NOTIFY)──▶ sync ──▶ Neo4j ──▶ analytics / recommendations
+      ▲                                      └──▶ SSE /api/events ──▶ browser refetches
+      └── any API client, and this app's own writes (UI → source API → same sync path)
+```
+- **Real time:** the backend `LISTEN`s on `crm_changes` (needs `SOURCE_PG_DSN`, a direct Postgres
+  connection; the ngrok URL carries HTTP only). Each notification re-reads that row from the API
+  and upserts (or deletes) it in Neo4j, typically within ~0.2 s. Without `SOURCE_PG_DSN` the app
+  polls the API every `SYNC_POLL_SECONDS` instead. If the connection drops it reconnects with
+  backoff and falls back to polling meanwhile.
+- **Safety net:** `NOTIFY` is not durable, so a full sync (rows new, changed or gone) runs at
+  startup, after every reconnect, every `SYNC_RECONCILE_SECONDS` and on `POST /api/admin/resync`.
+  It is idempotent and writes nothing when nothing changed.
+- **First run:** the first sync against a source *replaces* the people, clients, deals and
+  activities already in Neo4j (the old demo data); `Domain` nodes and added domains are kept.
+  It is remembered by a marker node, so later restarts only apply differences. It refuses to do
+  this if the source is empty. `POST /api/admin/resync?hard=true` repeats it; so does
+  `POST /api/admin/seed` ("Re-sync from source" in the Admin menu): in this mode nothing is
+  generated.
+- **Derived data:** `EXPERTISE_IN` / `SIMILAR_TO` are rebuilt a few seconds after the last deal or
+  sales person change (`SYNC_RECOMPUTE_DEBOUNCE_SECONDS`), then the UI refreshes.
+- **Writes from the UI** (new client/deal, stage moves, edits, activities, sales people, manual
+  override, auto-assignment) go to Postgres first through the source API, then through the same
+  upsert into Neo4j. A client + first deal is two inserts: if the deal fails the client is removed.
+- **Unassigned deals:** a deal with no `owner_id` (or one that does not exist) is loaded without an
+  owner and shows as "Unassigned"; the app does not auto-assign deals created outside it. Open the
+  deal and press "Run assignment" (or override) to give it an owner.
+- **Rows that cannot be loaded** (deal whose client is missing, unknown/invalid domain, activity
+  whose deal is missing) are skipped and listed in `GET /api/admin/sync/status` (and counted next
+  to the "Live" badge in the header); they are retried on every full sync. An unknown but valid
+  domain name is added automatically like `POST /api/domains` does (needs the embedding model).
+- **Live UI:** `GET /api/events` is a Server-Sent Events stream; the browser refetches when it
+  sees a change. The header badge shows Live / Connecting / Not live.
+- Deleting a deal in Postgres also removes its activities from Neo4j.
+
+```powershell
+# api/.env
+SOURCE_API_URL=http://127.0.0.1:8010
+SOURCE_API_KEY=<API_KEY from the Host db .env>
+SOURCE_PG_DSN=postgresql://crm:<password>@127.0.0.1:5433/crm
+```
+In Docker, point these at `host.docker.internal` instead of `127.0.0.1` (compose already maps it).
+If the source moves, change these values and restart the app. The integration tests never use a
+real source: they run standalone, and `tests/integration/test_source_sync.py` uses an in-memory
+fake of the API.
 
 ## How the forecast works
 `GET /api/analytics/forecast` estimates how many clients each sales person will convert this

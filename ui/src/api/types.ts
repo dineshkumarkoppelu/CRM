@@ -69,6 +69,16 @@ export interface SeedResult {
   seed: number;
 }
 
+export interface SyncStatus {
+  enabled: boolean;
+  mode: "off" | "listen" | "poll";
+  listening: boolean;
+  last_event_at: string | null;
+  events_applied: number;
+  last_error: string | null;
+  problems: { table: string; id: string; reason: string; at: string }[];
+}
+
 export interface RecomputeResult {
   expertise_edges: number;
   similar_pairs: number;

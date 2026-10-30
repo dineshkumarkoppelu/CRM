@@ -33,6 +33,7 @@ from app.models.salespeople import (
 from app.repositories import activities_repo, clients_repo, deals_repo, salespeople_repo
 from app.services import assignment_service, domain_service
 from app.services.recommendation_service import availability
+from app.sync import source_client, writes
 
 __all__ = ["availability", "month_range", "new_id", "next_state"]
 
@@ -211,7 +212,8 @@ async def create_sales_person(body: SalesPersonCreate) -> SalesPersonOut:
     capacity = body.capacity or get_config().assignment.capacity_default
 
     async def create() -> dict[str, Any]:
-        return await salespeople_repo.create_sales_person(
+        store = writes if source_client.enabled() else salespeople_repo
+        return await store.create_sales_person(
             rep_id=new_id("SP"),
             name=body.name,
             email=body.email,
@@ -228,7 +230,8 @@ async def update_sales_person(rep_id: str, body: SalesPersonUpdate) -> SalesPers
     changes = _plain(body.model_dump(exclude_unset=True))
     if not changes:
         return SalesPersonOut(**await _require_rep(rep_id))
-    row = await salespeople_repo.update_sales_person(rep_id, changes)
+    store = writes if source_client.enabled() else salespeople_repo
+    row = await store.update_sales_person(rep_id, changes)
     if row is None:
         raise _not_found("REP_NOT_FOUND", "Sales person", rep_id)
     return SalesPersonOut(**row)
@@ -258,7 +261,8 @@ async def create_client_with_deal(body: ClientWithDealCreate) -> ClientCreateRes
     today = clock.today()
 
     async def create() -> dict[str, Any]:
-        return await clients_repo.create_client_with_deal(
+        store = writes if source_client.enabled() else clients_repo
+        return await store.create_client_with_deal(
             client={
                 "id": new_id("CL"),
                 "name": body.client.name,
@@ -336,7 +340,8 @@ async def create_deal(body: DealCreate) -> DealCreateResult:
     async def create() -> bool:
         nonlocal deal_id
         deal_id = new_id("DL")
-        return await deals_repo.create_deal_for_client(
+        store = writes if source_client.enabled() else deals_repo
+        return await store.create_deal_for_client(
             deal_id=deal_id,
             client_id=body.client_id,
             title=body.title,
@@ -357,7 +362,8 @@ async def move_deal_stage(deal_id: str, action: StageAction) -> DealOut:
     deal = await _require_deal(deal_id)
     new_status, new_stage, date_field = next_state(deal["status"], deal["stage"], action)
     changes = {"status": new_status, "stage": new_stage, date_field: clock.today()}
-    if not await deals_repo.move_stage(deal_id, deal["status"], deal["stage"], changes):
+    store = writes if source_client.enabled() else deals_repo
+    if not await store.move_stage(deal_id, deal["status"], deal["stage"], changes):
         raise AppError("CONFLICT", "Deal was changed by another request; reload and retry", 409)
     return DealOut(**await _require_deal(deal_id))
 
@@ -369,7 +375,8 @@ async def update_deal(deal_id: str, body: DealUpdate) -> DealOut:
             "DEAL_CLOSED", f"Deal is {deal['status']}; only OPEN deals can be edited", 400
         )
     changes = _plain(body.model_dump(exclude_unset=True))
-    if changes and not await deals_repo.update_open_deal(deal_id, changes):
+    store = writes if source_client.enabled() else deals_repo
+    if changes and not await store.update_open_deal(deal_id, changes):
         raise AppError(
             "DEAL_CLOSED", "Deal was closed in the meantime; it can no longer be edited", 400
         )
@@ -399,7 +406,8 @@ async def create_activity(body: ActivityCreate) -> ActivityOut:
         )
 
     async def create() -> dict[str, Any] | None:
-        return await activities_repo.create_activity(
+        store = writes if source_client.enabled() else activities_repo
+        return await store.create_activity(
             activity_id=new_id("AC"),
             deal_id=body.deal_id,
             sales_person_id=body.sales_person_id,

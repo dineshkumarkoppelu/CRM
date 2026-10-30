@@ -53,8 +53,16 @@ services:
 
       SCHEDULER_ENABLED: ${SCHEDULER_ENABLED:-true}
 
+      # Optional Postgres data source (see README, "Live data source"). Inside Docker, the host
+      # machine is host.docker.internal, e.g. SOURCE_API_URL=http://host.docker.internal:8010
+      SOURCE_API_URL: ${SOURCE_API_URL:-}
+      SOURCE_API_KEY: ${SOURCE_API_KEY:-}
+      SOURCE_PG_DSN: ${SOURCE_PG_DSN:-}
+
     ports:
       - "8000:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # reach services on the host (Linux too)
 
     volumes:
       # Embedding model for "New domain" (~64 MB, downloaded on first use); survives rebuilds.

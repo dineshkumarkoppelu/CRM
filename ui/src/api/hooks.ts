@@ -37,11 +37,20 @@ import type {
   StageAction,
   StalledDeal,
   Subgraph,
+  SyncStatus,
 } from "./types";
 
 // ---- meta ----
 export const useHealth = () =>
   useQuery({ queryKey: ["health"], queryFn: () => api.get<Health>("/health"), retry: false });
+/** Whether Neo4j mirrors a Postgres data source, and the state of that link. */
+export const useSyncStatus = () =>
+  useQuery({
+    queryKey: ["admin", "sync"],
+    queryFn: () => api.get<SyncStatus>("/admin/sync/status"),
+    refetchInterval: 30_000,
+    retry: false,
+  });
 export const useConfig = () =>
   useQuery({ queryKey: ["meta", "config"], queryFn: () => api.get<AppConfig>("/meta/config"), staleTime: Infinity });
 /** Domain names in display order (built-ins first). Not static any more: domains can be added. */

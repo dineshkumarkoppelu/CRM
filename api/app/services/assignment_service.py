@@ -20,6 +20,7 @@ from app.repositories import deals_repo, recommendation_repo
 from app.repositories.recommendation_repo import OwnerConflict
 from app.services import domain_service
 from app.services import recommendation_service as rs
+from app.sync import source_client, writes
 
 NO_AVAILABLE_MESSAGE = "No available sales person (all inactive or at capacity)"
 OVERRIDE_PREFIX = "Manual override: "
@@ -141,13 +142,22 @@ async def assign_deal(deal_id: str) -> AssignmentResult:
     )
     statuses = ["ASSIGNED" if c.rank == 1 else "CANDIDATE" for c in ranking.candidates]
     top = ranking.candidates[0] if ranking.candidates else None
+    recs = [_rec_row(c, s) for c, s in zip(ranking.candidates, statuses, strict=True)]
     try:
-        await recommendation_repo.replace_recommendations(
-            deal_id,
-            [_rec_row(c, s) for c, s in zip(ranking.candidates, statuses, strict=True)],
-            owner_id=top.sales_person_id if top else None,
-            today=clock.today(),
-        )
+        if source_client.enabled():
+            # The owner goes to the source (Postgres) and reaches the graph through the sync.
+            if top:
+                await writes.set_owner(deal_id, top.sales_person_id, expect_unassigned=True)
+            await recommendation_repo.replace_recommendations(
+                deal_id, recs, owner_id=None, today=clock.today()
+            )
+        else:
+            await recommendation_repo.replace_recommendations(
+                deal_id,
+                recs,
+                owner_id=top.sales_person_id if top else None,
+                today=clock.today(),
+            )
     except OwnerConflict as exc:
         raise AppError(
             "ALREADY_ASSIGNED", "Deal was assigned or closed by another request", 409
@@ -281,7 +291,12 @@ async def override(deal_id: str, rep_id: str) -> AssignmentResult:
         "status": "ASSIGNED",
     }
     try:
-        await recommendation_repo.override_owner(deal_id, rep_id, new_rec, clock.today())
+        in_source = source_client.enabled()
+        if in_source:
+            await writes.set_owner(deal_id, rep_id, expect_unassigned=False)
+        await recommendation_repo.override_owner(
+            deal_id, rep_id, new_rec, clock.today(), move_owner=not in_source
+        )
     except OwnerConflict as exc:
         raise AppError("DEAL_CLOSED", "Deal was closed by another request", 400) from exc
     return await get_recommendations(deal_id, f"Manual override: assigned to {target.name}")

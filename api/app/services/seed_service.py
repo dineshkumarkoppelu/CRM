@@ -1,4 +1,8 @@
-"""Wipe the database and load the deterministic synthetic dataset."""
+"""Wipe the database and load the deterministic synthetic dataset.
+
+With a data source configured (SOURCE_API_URL) nothing is generated: "seed" re-syncs Neo4j from
+the source (Postgres) instead, replacing whatever else the graph holds.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +16,8 @@ from app.repositories import seed_repo
 from app.schema import runner as schema_runner
 from app.seed.generator import generate
 from app.services import busy, domain_service, expertise_service
+from app.sync import service as sync_service
+from app.sync import source_client
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +29,23 @@ async def seed_database() -> SeedResult:
     """
     async with busy.exclusive("seed"):
         with db.no_tx_timeout():
-            return await _seed()
+            return await (_resync_from_source() if source_client.enabled() else _seed())
+
+
+async def _resync_from_source() -> SeedResult:
+    """Hard re-sync from the data source, then recompute."""
+    started = time.perf_counter()
+    await sync_service.full_sync(force_adopt=True)
+    counts = SeedCounts(**await seed_repo.counts())
+    recompute = await expertise_service.recompute()
+    return SeedResult(
+        counts=counts,
+        expertise_edges=recompute.expertise_edges,
+        similar_pairs=recompute.similar_pairs,
+        duration_ms=round((time.perf_counter() - started) * 1000),
+        as_of_date=clock.today(),
+        seed=get_config().seed.seed_random_seed,
+    )
 
 
 async def _seed() -> SeedResult:

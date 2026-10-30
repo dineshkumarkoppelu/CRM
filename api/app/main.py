@@ -24,6 +24,7 @@ from app.routers import (
     clients,
     deals,
     domains,
+    events,
     graph,
     health,
     meta,
@@ -32,6 +33,7 @@ from app.routers import (
 )
 from app.schema import runner as schema_runner
 from app.services import domain_service, expertise_service, scheduler
+from app.sync import service as sync_service
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +46,7 @@ async def _after_schema() -> None:
     except db.CONNECTIVITY_ERRORS as exc:
         logger.warning("Built-in domain setup skipped: %s", exc)
     await _recompute_if_missing_safely()
+    sync_service.start()  # no-op unless SOURCE_API_URL / SOURCE_API_KEY are set
 
 
 async def _recompute_if_missing_safely() -> None:
@@ -79,6 +82,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        await sync_service.stop()
         scheduler.stop()
         if background is not None:
             background.cancel()
@@ -103,6 +107,7 @@ def create_app(ui_dist: Path = DEFAULT_UI_DIST) -> FastAPI:
         recommendations,
         graph,
         domains,
+        events,
     ):
         app.include_router(module.router, prefix="/api")
     mount_spa(app, ui_dist)  # built UI from <repo>/ui/dist (after the API routers)

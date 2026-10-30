@@ -2,7 +2,8 @@ import { useState, type ReactNode } from "react";
 import { Link, NavLink, useLocation } from "react-router-dom";
 
 import { errorMessage } from "../api/client";
-import { useHealth, useRecompute, useSeed } from "../api/hooks";
+import { useHealth, useRecompute, useSeed, useSyncStatus } from "../api/hooks";
+import { useLiveUpdates } from "../api/live";
 import { formatDate } from "../lib/format";
 import { ConfirmDialog } from "./Overlay";
 
@@ -35,6 +36,7 @@ function AdminMenu() {
   const [notice, setNotice] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
   const seed = useSeed();
   const recompute = useRecompute();
+  const fromSource = useSyncStatus().data?.enabled ?? false;
 
   const runSeed = () =>
     seed.mutate(undefined, {
@@ -42,7 +44,7 @@ function AdminMenu() {
         setConfirm(false);
         setNotice({
           kind: "ok",
-          text: `Demo data reset: ${r.counts.Deal} deals, ${r.counts.Client} clients, ${r.similar_pairs} similar pairs (${(r.duration_ms / 1000).toFixed(1)} s).`,
+          text: `${fromSource ? "Re-synced from the data source" : "Demo data reset"}: ${r.counts.Deal} deals, ${r.counts.Client} clients, ${r.similar_pairs} similar pairs (${(r.duration_ms / 1000).toFixed(1)} s).`,
         });
       },
       onError: (e) => {
@@ -79,8 +81,10 @@ function AdminMenu() {
               setConfirm(true);
             }}
           >
-            Reset demo data
-            <span className="block text-xs text-ink-muted">Wipe and reload the synthetic dataset</span>
+            {fromSource ? "Re-sync from source" : "Reset demo data"}
+            <span className="block text-xs text-ink-muted">
+              {fromSource ? "Reload everything from the Postgres data source" : "Wipe and reload the synthetic dataset"}
+            </span>
           </button>
           <button
             type="button"
@@ -96,15 +100,16 @@ function AdminMenu() {
       )}
       <ConfirmDialog
         open={confirm}
-        title="Reset demo data?"
-        confirmLabel="Reset data"
+        title={fromSource ? "Re-sync from the data source?" : "Reset demo data?"}
+        confirmLabel={fromSource ? "Re-sync" : "Reset data"}
         danger
         busy={seed.isPending}
         onConfirm={runSeed}
         onCancel={() => setConfirm(false)}
       >
-        This deletes every sales person, client, deal and activity in the database and loads the
-        synthetic dataset again. Deals and overrides created during the demo are lost.
+        {fromSource
+          ? "This replaces the graph's sales people, clients, deals and activities with what the Postgres data source holds now. Postgres itself is not changed; stored recommendations are rebuilt."
+          : "This deletes every sales person, client, deal and activity in the database and loads the synthetic dataset again. Deals and overrides created during the demo are lost."}
       </ConfirmDialog>
       {notice && (
         <div
@@ -120,6 +125,30 @@ function AdminMenu() {
         </div>
       )}
     </div>
+  );
+}
+
+function LiveBadge() {
+  const live = useLiveUpdates();
+  const sync = useSyncStatus();
+  if (!sync.data?.enabled) return null; // standalone mode: nothing is being mirrored
+  const label =
+    live === "live" ? (sync.data.listening ? "Live" : "Live (polling)") : live === "connecting" ? "Connecting…" : "Not live";
+  const dot = live === "live" ? "bg-won" : "bg-ink-faint";
+  const problems = sync.data.problems.length;
+  return (
+    <span
+      className="ml-3 inline-flex items-center gap-1.5 rounded-sm border border-line px-1.5 py-0.5 text-xs text-ink-muted"
+      title={
+        problems
+          ? `${problems} row(s) from the source could not be loaded: ${sync.data.problems[0].table} ${sync.data.problems[0].id} (${sync.data.problems[0].reason})`
+          : "Changes in the data source appear here automatically"
+      }
+    >
+      <span className={`h-1.5 w-1.5 rounded-full ${dot}`} aria-hidden />
+      {label}
+      {problems > 0 && <span className="text-warn">· {problems} skipped</span>}
+    </span>
   );
 }
 
@@ -168,6 +197,7 @@ export function Layout({ children }: { children: ReactNode }) {
             ) : health.error ? (
               <span className="text-lost">API unreachable</span>
             ) : null}
+            <LiveBadge />
             {degraded && (
               <span className="ml-3 rounded-sm bg-warn-soft px-1.5 py-0.5 text-xs text-warn">
                 {health.data?.neo4j.connected ? "Degraded: check plugins / schema" : "Database unreachable"}
